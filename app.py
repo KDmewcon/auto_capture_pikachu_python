@@ -6,11 +6,17 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from threading import Event
 from typing import Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
 import pyautogui
+
+try:
+    from pynput import keyboard as pynput_keyboard
+except Exception:
+    pynput_keyboard = None
 
 from pikachu.overlay import render_connectable_overlay
 from pikachu.solver import BoardSolver, PairPath
@@ -68,6 +74,16 @@ class PikachuRunner:
 
         self.auto_mode = auto_start
         self.last_action = "Ready"
+        self.clicked_cell_ignore_seconds = 1.1
+        self.pending_clears: Dict[Tuple[int, int], float] = {}
+        self.active_pending_clears = 0
+        self.auto_pair_cooldown_seconds = 2.0
+        self.auto_pair_cooldowns: Dict[Tuple[Tuple[int, int], Tuple[int, int]], float] = {}
+        self.last_board_signature: Optional[Tuple[Tuple[int, ...], ...]] = None
+        self.stop_requested = Event()
+        self.stop_message = "Emergency stop (Esc)"
+        self._esc_listener = self._start_esc_listener()
+        self.global_esc_supported = self._esc_listener is not None
 
         pyautogui.PAUSE = 0.01
         pyautogui.FAILSAFE = True
@@ -88,35 +104,44 @@ class PikachuRunner:
         frame = self.capturer.capture_region(self.region)
         board_frame = self._capture_board_frame(frame)
         scan = self.analyzer.analyze(board_frame)
+        self.active_pending_clears = self._apply_pending_clears(scan.board)
+
+        board_signature = tuple(tuple(row) for row in scan.board)
+        if board_signature != self.last_board_signature:
+            self.auto_pair_cooldowns.clear()
+            self.last_board_signature = board_signature
+
         pairs = BoardSolver(scan.board).find_all_pairs()
         return frame, scan, pairs
 
-    def click_pair(self, pair: PairPath, scan: BoardScanResult) -> None:
+    def click_pair(self, pair: PairPath, scan: BoardScanResult) -> bool:
+        if self.stop_requested.is_set():
+            return False
+
         x1 = self.region.left + self.board_grid.left + int(round((pair.start[1] + 0.5) * scan.cell_width))
         y1 = self.region.top + self.board_grid.top + int(round((pair.start[0] + 0.5) * scan.cell_height))
         x2 = self.region.left + self.board_grid.left + int(round((pair.end[1] + 0.5) * scan.cell_width))
         y2 = self.region.top + self.board_grid.top + int(round((pair.end[0] + 0.5) * scan.cell_height))
 
         pyautogui.click(x=x1, y=y1)
-        time.sleep(0.045)
-        pyautogui.click(x=x2, y=y2)
-
-    def recalibrate_grid(self) -> bool:
-        grid = self.capturer.select_board_grid(
-            region=self.region,
-            rows=self.settings.rows,
-            cols=self.settings.cols,
-            window_name="Calibrate Pikachu Grid",
-        )
-        if grid is None:
-            self.last_action = "Grid calibration canceled"
+        if not self._interruptible_sleep(0.045):
             return False
+        if self.stop_requested.is_set():
+            return False
+        pyautogui.click(x=x2, y=y2)
+        self._remember_clicked_pair(pair)
+        return True
 
-        self.board_grid = grid.clamp(self.region.width, self.region.height)
-        self.last_action = (
-            f"Grid calibrated L={self.board_grid.left} T={self.board_grid.top} "
-            f"W={self.board_grid.width} H={self.board_grid.height}"
-        )
+    def request_emergency_stop(self, message: str = "Emergency stop (Esc)") -> None:
+        self.auto_mode = False
+        self.stop_message = message
+        self.last_action = message
+        self.stop_requested.set()
+
+    def _consume_emergency_stop(self) -> bool:
+        if not self.stop_requested.is_set():
+            return False
+        self.stop_requested.clear()
         return True
 
     def reselect_region(self) -> bool:
@@ -126,20 +151,13 @@ class PikachuRunner:
             return False
 
         self.region = region
+        self.pending_clears.clear()
+        self.active_pending_clears = 0
+        self.auto_pair_cooldowns.clear()
+        self.last_board_signature = None
 
-        # Keep a safe fallback so scan can still run even if calibration is skipped.
         self.board_grid = BoardGrid.full_region(region.width, region.height)
-        calibrated = self.recalibrate_grid()
-        if calibrated:
-            self.last_action = (
-                f"Region + grid updated. Region L={region.left} T={region.top} "
-                f"W={region.width} H={region.height}"
-            )
-        else:
-            self.last_action = (
-                f"Region updated L={region.left} T={region.top} W={region.width} H={region.height}. "
-                "Using full ROI grid; press G to calibrate for best accuracy."
-            )
+        self.last_action = f"Region updated L={region.left} T={region.top} W={region.width} H={region.height}"
         return True
 
     def _capture_board_frame(self, frame: np.ndarray) -> np.ndarray:
@@ -150,6 +168,94 @@ class PikachuRunner:
         y1 = y0 + self.board_grid.height
         return frame[y0:y1, x0:x1]
 
+    def _remember_clicked_pair(self, pair: PairPath) -> None:
+        expires_at = time.monotonic() + self.clicked_cell_ignore_seconds
+        for cell in (pair.start, pair.end):
+            previous = self.pending_clears.get(cell, 0.0)
+            if expires_at > previous:
+                self.pending_clears[cell] = expires_at
+
+    @staticmethod
+    def _pair_key(pair: PairPath) -> Tuple[Tuple[int, int], Tuple[int, int]]:
+        start, end = sorted((pair.start, pair.end))
+        return start, end
+
+    def _pick_auto_pair(self, pairs: List[PairPath]) -> Optional[PairPath]:
+        if not pairs:
+            return None
+
+        now = time.monotonic()
+        expired = [key for key, expiry in self.auto_pair_cooldowns.items() if expiry <= now]
+        for key in expired:
+            self.auto_pair_cooldowns.pop(key, None)
+
+        for pair in pairs:
+            key = self._pair_key(pair)
+            if key not in self.auto_pair_cooldowns:
+                return pair
+        return None
+
+    def _mark_auto_pair(self, pair: PairPath) -> None:
+        self.auto_pair_cooldowns[self._pair_key(pair)] = time.monotonic() + self.auto_pair_cooldown_seconds
+
+    def _apply_pending_clears(self, board: List[List[int]]) -> int:
+        if not self.pending_clears:
+            return 0
+
+        now = time.monotonic()
+        expired_cells: List[Tuple[int, int]] = []
+        active_count = 0
+
+        for cell, expiry in self.pending_clears.items():
+            if expiry <= now:
+                expired_cells.append(cell)
+                continue
+
+            row, col = cell
+            if 0 <= row < self.settings.rows and 0 <= col < self.settings.cols:
+                board[row][col] = 0
+                active_count += 1
+            else:
+                expired_cells.append(cell)
+
+        for cell in expired_cells:
+            self.pending_clears.pop(cell, None)
+
+        return active_count
+
+    def _interruptible_sleep(self, duration: float) -> bool:
+        end = time.monotonic() + max(0.0, duration)
+        while True:
+            if self.stop_requested.is_set():
+                return False
+            remaining = end - time.monotonic()
+            if remaining <= 0:
+                return True
+            time.sleep(min(0.01, remaining))
+
+    def _start_esc_listener(self):
+        if pynput_keyboard is None:
+            return None
+
+        def on_press(key: object) -> Optional[bool]:
+            if key == pynput_keyboard.Key.esc:
+                self.request_emergency_stop()
+                return None
+            return None
+
+        listener = pynput_keyboard.Listener(on_press=on_press)
+        listener.daemon = True
+        listener.start()
+        return listener
+
+    def shutdown(self) -> None:
+        if self._esc_listener is not None:
+            try:
+                self._esc_listener.stop()
+            except Exception:
+                pass
+            self._esc_listener = None
+
     def run(self) -> None:
         cv2.namedWindow(WINDOW_TITLE, cv2.WINDOW_NORMAL)
         cv2.resizeWindow(WINDOW_TITLE, max(920, self.region.width), max(560, self.region.height))
@@ -157,18 +263,23 @@ class PikachuRunner:
         last_auto_click = 0.0
 
         while True:
+            panic_stop = self._consume_emergency_stop()
+            if panic_stop:
+                self.last_action = self.stop_message
+
             try:
                 frame, scan, pairs = self.scan_once()
             except Exception as exc:
                 canvas = self._error_canvas(f"Scan failed: {exc}")
                 cv2.imshow(WINDOW_TITLE, canvas)
                 key = cv2.waitKey(25) & 0xFF
-                if key in (ord("q"), 27):
+                if key == 27:
+                    self.request_emergency_stop()
+                    continue
+                if key == ord("q"):
                     break
                 if key == ord("r"):
                     self.reselect_region()
-                elif key == ord("g"):
-                    self.recalibrate_grid()
                 continue
 
             overlay = render_connectable_overlay(
@@ -187,33 +298,46 @@ class PikachuRunner:
             cv2.imshow(WINDOW_TITLE, overlay)
 
             now = time.time()
-            if self.auto_mode and pairs and now - last_auto_click >= self.auto_interval:
-                self.click_pair(pairs[0], scan)
-                last_auto_click = now
-                self.last_action = (
-                    f"Auto clicked {self._format_coord(pairs[0].start)} -> "
-                    f"{self._format_coord(pairs[0].end)}"
-                )
+            auto_pair = self._pick_auto_pair(pairs)
+            if self.auto_mode and auto_pair and now - last_auto_click >= self.auto_interval:
+                clicked = self.click_pair(auto_pair, scan)
+                if clicked:
+                    self._mark_auto_pair(auto_pair)
+                    last_auto_click = now
+                    self.last_action = (
+                        f"Auto clicked {self._format_coord(auto_pair.start)} -> "
+                        f"{self._format_coord(auto_pair.end)}"
+                    )
+                elif self.stop_requested.is_set():
+                    self._consume_emergency_stop()
+                    self.last_action = self.stop_message
 
             key = cv2.waitKey(1) & 0xFF
-            if key in (ord("q"), 27):
+            if key == 27:
+                self.request_emergency_stop()
+                continue
+            if key == ord("q"):
                 break
             if key == ord("a"):
                 self.auto_mode = not self.auto_mode
                 self.last_action = f"Auto mode {'ON' if self.auto_mode else 'OFF'}"
             elif key == ord("c"):
                 if pairs:
-                    self.click_pair(pairs[0], scan)
-                    self.last_action = (
-                        f"Manual clicked {self._format_coord(pairs[0].start)} -> "
-                        f"{self._format_coord(pairs[0].end)}"
-                    )
+                    if self.click_pair(pairs[0], scan):
+                        self.last_action = (
+                            f"Manual clicked {self._format_coord(pairs[0].start)} -> "
+                            f"{self._format_coord(pairs[0].end)}"
+                        )
+                    else:
+                        if self.stop_requested.is_set():
+                            self._consume_emergency_stop()
+                            self.last_action = self.stop_message
+                        else:
+                            self.last_action = "Manual click interrupted"
                 else:
                     self.last_action = "No connectable pairs"
             elif key == ord("r"):
                 self.reselect_region()
-            elif key == ord("g"):
-                self.recalibrate_grid()
             elif key == ord("w"):
                 image_path = Path(f"overlay_{int(time.time())}.png")
                 cv2.imwrite(str(image_path), overlay)
@@ -235,11 +359,15 @@ class PikachuRunner:
                 f"Pairs: {len(pairs)} | Auto: {'ON' if self.auto_mode else 'OFF'} "
                 f"| Interval: {self.auto_interval:.2f}s"
             ),
-            "Keys: [A]uto [C]lick [R]eselect ROI [G]rid calibrate [W]rite snapshot [Q]/Esc quit",
+            (
+                f"Pending skip cells: {self.active_pending_clears} | "
+                f"Auto cooldown pairs: {len(self.auto_pair_cooldowns)}"
+            ),
+            "Keys: [A]uto [C]lick [R]eselect ROI [W]rite [Esc] stop [Q] quit",
             f"Last action: {self.last_action}",
         ]
 
-        y = image.shape[0] - 92
+        y = image.shape[0] - 112
         for line in hud_lines:
             cv2.putText(
                 image,
@@ -259,7 +387,7 @@ class PikachuRunner:
         cv2.putText(canvas, message, (20, 210), cv2.FONT_HERSHEY_SIMPLEX, 0.62, (70, 180, 255), 2)
         cv2.putText(
             canvas,
-            "Press R to select region, G to calibrate grid, or Q to quit.",
+            "Press R to select region again or Q to quit.",
             (20, 245),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.52,
@@ -397,11 +525,6 @@ def parse_args() -> argparse.Namespace:
         help="Always open region selector even when a saved region exists",
     )
     parser.add_argument(
-        "--select-grid",
-        action="store_true",
-        help="Open grid calibration (pick top-left and bottom-right tile centers)",
-    )
-    parser.add_argument(
         "--auto-start",
         action="store_true",
         help="Start auto mode immediately",
@@ -430,37 +553,10 @@ def resolve_region(
 
 
 def resolve_board_grid(
-    capturer: ScreenCapturer,
     region: CaptureRegion,
-    settings: ScanSettings,
-    config: Dict[str, object],
-    force_select: bool,
 ) -> BoardGrid:
-    saved_rows = int(config["rows"]) if isinstance(config.get("rows"), int) else None
-    saved_cols = int(config["cols"]) if isinstance(config.get("cols"), int) else None
-
-    if (
-        not force_select
-        and isinstance(config.get("board_grid"), dict)
-        and saved_rows == settings.rows
-        and saved_cols == settings.cols
-    ):
-        try:
-            saved_grid = BoardGrid.from_dict(config["board_grid"])
-            return saved_grid.clamp(region.width, region.height)
-        except Exception:
-            pass
-
-    picked = capturer.select_board_grid(
-        region=region,
-        rows=settings.rows,
-        cols=settings.cols,
-        window_name="Calibrate Pikachu Grid",
-    )
-    if picked is None:
-        print("Grid calibration skipped. Falling back to full ROI; press G later to calibrate.")
-        return BoardGrid.full_region(region.width, region.height)
-    return picked.clamp(region.width, region.height)
+    # The selected ROI is the board area directly.
+    return BoardGrid.full_region(region.width, region.height)
 
 
 def main() -> None:
@@ -468,6 +564,7 @@ def main() -> None:
     config = load_config()
 
     capturer = ScreenCapturer()
+    runner: Optional[PikachuRunner] = None
     try:
         monitors = capturer.list_monitors()
         if not monitors:
@@ -492,9 +589,9 @@ def main() -> None:
             empty_ink_threshold=float(
                 pick_number("empty_ink_threshold", args.empty_ink, config, 0.16)
             ),
-            template_similarity=float(pick_number("template_similarity", args.similarity, config, 0.92)),
+            template_similarity=float(pick_number("template_similarity", args.similarity, config, 0.9)),
             template_ambiguity_margin=float(
-                pick_number("template_ambiguity_margin", args.ambiguity_margin, config, 0.015)
+                pick_number("template_ambiguity_margin", args.ambiguity_margin, config, 0.01)
             ),
             template_update_weight=float(
                 pick_number("template_update_weight", args.template_update, config, 0.2)
@@ -513,11 +610,7 @@ def main() -> None:
         )
 
         board_grid = resolve_board_grid(
-            capturer=capturer,
             region=region,
-            settings=settings,
-            config=config,
-            force_select=(args.select_grid or args.select_region),
         )
 
         runner = PikachuRunner(
@@ -534,9 +627,11 @@ def main() -> None:
         print("  A = toggle auto mode")
         print("  C = click one pair")
         print("  R = reselect board region")
-        print("  G = recalibrate board grid using 2 tile centers")
         print("  W = save current overlay snapshot")
-        print("  Q / Esc = quit")
+        print("  Esc = emergency stop immediately")
+        print("  Q = quit")
+        if not runner.global_esc_supported:
+            print("  Note: global Esc listener unavailable; run pip install -r requirements.txt")
         print("\nTip: move mouse to top-left corner to trigger PyAutoGUI fail-safe if needed.\n")
 
         runner.run()
@@ -549,6 +644,8 @@ def main() -> None:
             auto_interval=auto_interval,
         )
     finally:
+        if runner is not None:
+            runner.shutdown()
         cv2.destroyAllWindows()
         capturer.close()
 

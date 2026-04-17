@@ -131,6 +131,14 @@ class BoardScanResult:
     tile_count: int
 
 
+@dataclass
+class TileObservation:
+    row: int
+    col: int
+    feature: np.ndarray
+    gray_signature: np.ndarray
+
+
 class ScreenCapturer:
     def __init__(self) -> None:
         self._sct = mss.mss()
@@ -394,8 +402,7 @@ class BoardAnalyzer:
         cell_height = height / float(self.rows)
 
         board = [[0 for _ in range(self.cols)] for _ in range(self.rows)]
-        template_features: List[np.ndarray] = []
-        template_gray_signatures: List[np.ndarray] = []
+        observations: List[TileObservation] = []
 
         for row in range(self.rows):
             for col in range(self.cols):
@@ -403,13 +410,25 @@ class BoardAnalyzer:
                 inner_cell = self._crop_inner(cell)
                 if self._is_empty(inner_cell):
                     continue
-                board[row][col] = self._assign_tile_id(inner_cell, template_features, template_gray_signatures)
+
+                observations.append(
+                    TileObservation(
+                        row=row,
+                        col=col,
+                        feature=self._extract_feature(inner_cell),
+                        gray_signature=self._extract_gray_signature(inner_cell),
+                    )
+                )
+
+        labels = self._cluster_tile_observations(observations)
+        for observation, label in zip(observations, labels):
+            board[observation.row][observation.col] = label
 
         return BoardScanResult(
             board=board,
             cell_width=cell_width,
             cell_height=cell_height,
-            tile_count=len(template_features),
+            tile_count=max(labels, default=0),
         )
 
     def _crop_cell(
@@ -461,47 +480,145 @@ class BoardAnalyzer:
             and ink_ratio < self.empty_ink_threshold
         )
 
-    def _assign_tile_id(
-        self,
-        cell: np.ndarray,
-        template_features: List[np.ndarray],
-        template_gray_signatures: List[np.ndarray],
-    ) -> int:
-        feature = self._extract_feature(cell)
-        gray_signature = self._extract_gray_signature(cell)
+    def _cluster_tile_observations(self, observations: List[TileObservation]) -> List[int]:
+        count = len(observations)
+        if count == 0:
+            return []
 
-        if not template_features:
-            template_features.append(feature)
-            template_gray_signatures.append(gray_signature)
-            return 1
+        parents = list(range(count))
 
-        scores = [
-            self._combined_similarity(feature, gray_signature, existing, template_gray_signatures[index])
-            for index, existing in enumerate(template_features)
-        ]
-        best_index = int(np.argmax(scores))
-        best_score = scores[best_index]
-        second_best = max((score for i, score in enumerate(scores) if i != best_index), default=-1.0)
+        def find(index: int) -> int:
+            while parents[index] != index:
+                parents[index] = parents[parents[index]]
+                index = parents[index]
+            return index
 
-        if (
-            best_score >= self.template_similarity
-            and (best_score - second_best) >= self.template_ambiguity_margin
-        ):
-            template_features[best_index] = self._blend_and_normalize(
-                template_features[best_index],
-                feature,
-                self.template_update_weight,
-            )
-            template_gray_signatures[best_index] = self._blend_and_normalize(
-                template_gray_signatures[best_index],
-                gray_signature,
-                self.template_update_weight,
-            )
-            return best_index + 1
+        def union(a: int, b: int) -> None:
+            root_a = find(a)
+            root_b = find(b)
+            if root_a == root_b:
+                return
+            if root_a < root_b:
+                parents[root_b] = root_a
+            else:
+                parents[root_a] = root_b
 
-        template_features.append(feature)
-        template_gray_signatures.append(gray_signature)
-        return len(template_features)
+        # Strict merge: very likely same icon.
+        for i in range(count):
+            obs_i = observations[i]
+            for j in range(i + 1, count):
+                obs_j = observations[j]
+                score = self._combined_similarity(
+                    obs_i.feature,
+                    obs_i.gray_signature,
+                    obs_j.feature,
+                    obs_j.gray_signature,
+                )
+                if score >= self.template_similarity:
+                    union(i, j)
+
+        def build_groups() -> Dict[int, List[int]]:
+            groups: Dict[int, List[int]] = {}
+            for index in range(count):
+                root = find(index)
+                groups.setdefault(root, []).append(index)
+            return groups
+
+        def group_prototype(indexes: List[int]) -> Tuple[np.ndarray, np.ndarray]:
+            feature_stack = np.stack([observations[index].feature for index in indexes], axis=0)
+            gray_stack = np.stack([observations[index].gray_signature for index in indexes], axis=0)
+
+            feature = np.mean(feature_stack, axis=0)
+            gray = np.mean(gray_stack, axis=0)
+
+            feature_norm = float(np.linalg.norm(feature))
+            gray_norm = float(np.linalg.norm(gray))
+            if feature_norm > 1e-6:
+                feature = feature / feature_norm
+            if gray_norm > 1e-6:
+                gray = gray / gray_norm
+            return feature, gray
+
+        relaxed_threshold = max(0.0, self.template_similarity - max(0.03, self.template_ambiguity_margin * 2.5))
+
+        # Relaxed merge for singletons: prevents over-splitting that hides valid paths.
+        groups = build_groups()
+        singleton_roots = [root for root, indexes in groups.items() if len(indexes) == 1]
+        singleton_best: Dict[int, Tuple[int, float]] = {}
+
+        for root in singleton_roots:
+            idx = groups[root][0]
+            obs = observations[idx]
+            best_root = root
+            best_score = -1.0
+            for other_root in singleton_roots:
+                if other_root == root:
+                    continue
+                other_idx = groups[other_root][0]
+                other_obs = observations[other_idx]
+                score = self._combined_similarity(
+                    obs.feature,
+                    obs.gray_signature,
+                    other_obs.feature,
+                    other_obs.gray_signature,
+                )
+                if score > best_score:
+                    best_score = score
+                    best_root = other_root
+            singleton_best[root] = (best_root, best_score)
+
+        for root, (best_root, best_score) in singleton_best.items():
+            reverse = singleton_best.get(best_root)
+            if reverse is None:
+                continue
+            reverse_root, reverse_score = reverse
+            if reverse_root != root:
+                continue
+            if best_score < relaxed_threshold or reverse_score < relaxed_threshold:
+                continue
+
+            union(groups[root][0], groups[best_root][0])
+
+        groups = build_groups()
+        singleton_roots = [root for root, indexes in groups.items() if len(indexes) == 1]
+        stable_roots = [root for root, indexes in groups.items() if len(indexes) > 1]
+
+        if singleton_roots and stable_roots:
+            stable_prototypes = {
+                root: group_prototype(indexes)
+                for root, indexes in groups.items()
+                if len(indexes) > 1
+            }
+
+            for root in singleton_roots:
+                idx = groups[root][0]
+                obs = observations[idx]
+
+                best_root: Optional[int] = None
+                best_score = -1.0
+                for stable_root in stable_roots:
+                    feature, gray = stable_prototypes[stable_root]
+                    score = self._combined_similarity(
+                        obs.feature,
+                        obs.gray_signature,
+                        feature,
+                        gray,
+                    )
+                    if score > best_score:
+                        best_score = score
+                        best_root = stable_root
+
+                if best_root is not None and best_score >= relaxed_threshold:
+                    union(idx, groups[best_root][0])
+
+        groups = build_groups()
+        ordered_roots = sorted(groups.keys(), key=lambda root: min(groups[root]))
+        root_to_label = {root: index + 1 for index, root in enumerate(ordered_roots)}
+
+        labels = [0 for _ in range(count)]
+        for index in range(count):
+            labels[index] = root_to_label[find(index)]
+        return labels
 
     @staticmethod
     def _extract_feature(cell: np.ndarray) -> np.ndarray:
